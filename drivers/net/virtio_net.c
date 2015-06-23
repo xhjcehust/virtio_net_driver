@@ -15,7 +15,6 @@
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
-//#define DEBUG
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
@@ -28,6 +27,7 @@
 #include <linux/cpu.h>
 #include <linux/average.h>
 #include <net/busy_poll.h>
+#include <linux/pci.h>
 
 static int napi_weight = NAPI_POLL_WEIGHT;
 module_param(napi_weight, int, 0444);
@@ -51,6 +51,17 @@ module_param(gso, bool, 0444);
 #define MERGEABLE_BUFFER_ALIGN max(L1_CACHE_BYTES, 256)
 
 #define VIRTNET_DRIVER_VERSION "1.0.0"
+#define __VIRTNET_TESTING  0
+
+static const struct {
+	const char string[ETH_GSTRING_LEN];
+} virtnet_gstrings_test[] = {
+	{ "loopback test   (offline)" },
+	{ "negotiate test  (offline)" },
+	{ "reset test     (offline)" },
+};
+
+#define VIRTNET_NUM_TEST	ARRAY_SIZE(virtnet_gstrings_test)
 
 struct virtnet_stats {
 	struct u64_stats_sync tx_syncp;
@@ -104,6 +115,8 @@ struct virtnet_info {
 	struct send_queue *sq;
 	struct receive_queue *rq;
 	unsigned int status;
+	unsigned long flags;
+	atomic_t lb_count;
 
 	/* Max # of queue pairs supported by the device */
 	u16 max_queue_pairs;
@@ -436,6 +449,19 @@ err_buf:
 	return NULL;
 }
 
+void virtnet_check_lb_frame(struct virtnet_info *vi,
+				   struct sk_buff *skb)
+{
+	unsigned int frame_size = skb->len;
+
+	if (*(skb->data + 3) == 0xFF) {
+		if ((*(skb->data + frame_size / 2 + 10) == 0xBE) &&
+		   (*(skb->data + frame_size / 2 + 12) == 0xAF)) {
+			atomic_dec(&vi->lb_count);
+		}
+	}
+}
+
 static void receive_buf(struct receive_queue *rq, void *buf, unsigned int len)
 {
 	struct virtnet_info *vi = rq->vq->vdev->priv;
@@ -485,7 +511,12 @@ static void receive_buf(struct receive_queue *rq, void *buf, unsigned int len)
 	} else if (hdr->hdr.flags & VIRTIO_NET_HDR_F_DATA_VALID) {
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
 	}
-
+	/* loopback self test for ethtool */
+	if (test_bit(__VIRTNET_TESTING, &vi->flags)) {
+		virtnet_check_lb_frame(vi, skb);
+		dev_kfree_skb_any(skb);
+		return;
+	}
 	skb->protocol = eth_type_trans(skb, dev);
 	pr_debug("Receiving skb proto 0x%04x len %i type %i\n",
 		 ntohs(skb->protocol), skb->len, skb->pkt_type);
@@ -813,6 +844,9 @@ static int virtnet_open(struct net_device *dev)
 {
 	struct virtnet_info *vi = netdev_priv(dev);
 	int i;
+	/* disallow open during test */
+	if (test_bit(__VIRTNET_TESTING, &vi->flags))
+		return -EBUSY;
 
 	for (i = 0; i < vi->max_queue_pairs; i++) {
 		if (i < vi->curr_queue_pairs)
@@ -1363,12 +1397,168 @@ static void virtnet_get_channels(struct net_device *dev,
 	channels->other_count = 0;
 }
 
+static int virtnet_reset(struct virtnet_info *vi, u64 *data);
+
+static void virtnet_create_lb_frame(struct sk_buff *skb,
+					unsigned int frame_size)
+{
+	memset(skb->data, 0xFF, frame_size);
+	frame_size &= ~1;
+	memset(&skb->data[frame_size / 2], 0xAA, frame_size / 2 - 1);
+	memset(&skb->data[frame_size / 2 + 10], 0xBE, 1);
+	memset(&skb->data[frame_size / 2 + 12], 0xAF, 1);
+}
+
+static int virtnet_start_loopback(struct virtnet_info *vi)
+{
+	int i;
+
+	if (!virtnet_send_command(vi, VIRTIO_NET_CTRL_LOOPBACK,
+				  VIRTIO_NET_CTRL_LOOPBACK_SET, NULL, NULL)) {
+		dev_warn(&vi->dev->dev, "Failed to set loopback.\n");
+		return -EINVAL;
+	}
+	for (i = 0; i < vi->curr_queue_pairs; i++)
+		napi_disable(&vi->rq[i].napi);
+	return 0;
+}
+
+static int virtnet_run_loopback_test(struct virtnet_info *vi)
+{
+	int i;
+	struct sk_buff *skb;
+	unsigned int size = GOOD_COPY_LEN;
+
+	for (i = 0; i < 100; i++) {
+		skb = netdev_alloc_skb(vi->dev, size);
+		if (!skb)
+			return -ENOMEM;
+
+		skb->queue_mapping = 0;
+		skb_put(skb, size);
+		virtnet_create_lb_frame(skb, size);
+		start_xmit(skb, vi->dev);
+		atomic_inc(&vi->lb_count);
+	}
+	free_old_xmit_skbs(&vi->sq[skb->queue_mapping]);
+	/* Give queue time to settle before testing results. */
+	msleep(20);
+	for (i = 0; i < vi->curr_queue_pairs; i++) {
+		void *buf;
+		unsigned int len, received = 0;
+
+		while ((received < 100) &&
+			(buf = virtqueue_get_buf(vi->rq[i].vq, &len)) != NULL) {
+			receive_buf(&vi->rq[i], buf, len);
+			--vi->rq[i].num;
+			received++;
+		}
+		if ((vi->rq[i].vq)->num_free <
+				virtqueue_get_vring_size(vi->rq[i].vq) / 2)
+			if (!try_fill_recv(&vi->rq[i], GFP_ATOMIC))
+				schedule_delayed_work(&vi->refill, 0);
+	}
+	return atomic_read(&vi->lb_count) ? -EIO : 0;
+}
+
+static int virtnet_stop_loopback(struct virtnet_info *vi)
+{
+	int i;
+
+	for (i = 0; i < vi->curr_queue_pairs; i++)
+		virtnet_napi_enable(&vi->rq[i]);
+	if (!virtnet_send_command(vi, VIRTIO_NET_CTRL_LOOPBACK,
+				  VIRTIO_NET_CTRL_LOOPBACK_UNSET, NULL, NULL)) {
+		dev_warn(&vi->dev->dev, "Failed to unset loopback.\n");
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int virtnet_loopback_test(struct virtnet_info *vi, u64 *data)
+{
+	*data = virtnet_start_loopback(vi);
+	if (*data)
+		goto out;
+	*data = virtnet_run_loopback_test(vi);
+	if (*data)
+		goto out;
+	*data = virtnet_stop_loopback(vi);
+out:
+	return *data;
+}
+
+static int virtnet_feature_neg_test(struct virtnet_info *vi, u64 *data)
+{
+	struct virtio_device *dev = vi->vdev;
+	u8 status;
+
+	status = dev->config->get_status(dev);
+	if (status & VIRTIO_CONFIG_S_DRIVER_OK) {
+		u8 test_status = status & ~VIRTIO_CONFIG_S_DRIVER_OK;
+
+		dev->config->set_status(dev, test_status);
+	}
+	*data = virtio_feature_negotiate(dev);
+	dev->config->set_status(dev, status);
+	return *data;
+}
+
+static int virtnet_get_sset_count(struct net_device *netdev, int sset)
+{
+	switch (sset) {
+	case ETH_SS_TEST:
+		return VIRTNET_NUM_TEST;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static void virtnet_get_strings(struct net_device *dev, u32 stringset, u8 *buf)
+{
+	switch (stringset) {
+	case ETH_SS_TEST:
+		memcpy(buf, &virtnet_gstrings_test,
+			sizeof(virtnet_gstrings_test));
+		break;
+	default:
+		break;
+	}
+}
+
+static void virtnet_self_test(struct net_device *netdev,
+			    struct ethtool_test *eth_test, u64 *data)
+{
+	struct virtnet_info *vi = netdev_priv(netdev);
+
+	memset(data, 0, sizeof(u64) * VIRTNET_NUM_TEST);
+	if (netif_running(netdev)) {
+		set_bit(__VIRTNET_TESTING, &vi->flags);
+		if (eth_test->flags == ETH_TEST_FL_OFFLINE) {
+			if (virtnet_loopback_test(vi, &data[0]))
+				eth_test->flags |= ETH_TEST_FL_FAILED;
+			if (virtnet_feature_neg_test(vi, &data[1]))
+				eth_test->flags |= ETH_TEST_FL_FAILED;
+			if (virtnet_reset(vi, &data[2]))
+				eth_test->flags |= ETH_TEST_FL_FAILED;
+		}
+		clear_bit(__VIRTNET_TESTING, &vi->flags);
+	} else {
+		dev_warn(&vi->dev->dev,
+			"%s is down, Loopback test will fail.\n", netdev->name);
+		eth_test->flags |= ETH_TEST_FL_FAILED;
+	}
+}
+
 static const struct ethtool_ops virtnet_ethtool_ops = {
 	.get_drvinfo = virtnet_get_drvinfo,
 	.get_link = ethtool_op_get_link,
 	.get_ringparam = virtnet_get_ringparam,
 	.set_channels = virtnet_set_channels,
 	.get_channels = virtnet_get_channels,
+	.self_test = virtnet_self_test,
+	.get_strings		= virtnet_get_strings,
+	.get_sset_count = virtnet_get_sset_count,
 };
 
 #define MIN_MTU 68
@@ -1890,13 +2080,9 @@ static void virtnet_remove(struct virtio_device *vdev)
 	free_netdev(vi->dev);
 }
 
-#ifdef CONFIG_PM_SLEEP
-static int virtnet_freeze(struct virtio_device *vdev)
+static void virtnet_stop(struct virtnet_info *vi)
 {
-	struct virtnet_info *vi = vdev->priv;
 	int i;
-
-	unregister_hotcpu_notifier(&vi->nb);
 
 	/* Prevent config work handler from accessing the device */
 	mutex_lock(&vi->config_lock);
@@ -1906,24 +2092,20 @@ static int virtnet_freeze(struct virtio_device *vdev)
 	netif_device_detach(vi->dev);
 	cancel_delayed_work_sync(&vi->refill);
 
-	if (netif_running(vi->dev)) {
+	if (netif_running(vi->dev))
 		for (i = 0; i < vi->max_queue_pairs; i++) {
 			napi_disable(&vi->rq[i].napi);
 			napi_hash_del(&vi->rq[i].napi);
 			netif_napi_del(&vi->rq[i].napi);
 		}
-	}
 
 	remove_vq_common(vi);
 
 	flush_work(&vi->config_work);
-
-	return 0;
 }
 
-static int virtnet_restore(struct virtio_device *vdev)
+static int virtnet_start(struct virtnet_info *vi)
 {
-	struct virtnet_info *vi = vdev->priv;
 	int err, i;
 
 	err = init_vqs(vi);
@@ -1944,7 +2126,27 @@ static int virtnet_restore(struct virtio_device *vdev)
 	mutex_lock(&vi->config_lock);
 	vi->config_enable = true;
 	mutex_unlock(&vi->config_lock);
+	return 0;
+}
 
+#ifdef CONFIG_PM_SLEEP
+static int virtnet_freeze(struct virtio_device *vdev)
+{
+	struct virtnet_info *vi = vdev->priv;
+
+	unregister_hotcpu_notifier(&vi->nb);
+	virtnet_stop(vi);
+	return 0;
+}
+
+static int virtnet_restore(struct virtio_device *vdev)
+{
+	struct virtnet_info *vi = vdev->priv;
+	int err;
+
+	err = virtnet_start(vi);
+	if (err)
+		return err;
 	rtnl_lock();
 	virtnet_set_queues(vi, vi->curr_queue_pairs);
 	rtnl_unlock();
@@ -1956,6 +2158,22 @@ static int virtnet_restore(struct virtio_device *vdev)
 	return 0;
 }
 #endif
+
+static int virtnet_reset(struct virtnet_info *vi, u64 *data)
+{
+	struct virtio_device *vdev = vi->vdev;
+	u8 status;
+
+	virtnet_stop(vi);
+	virtio_feature_negotiate(vdev);
+	*data = virtnet_start(vi);
+	if (*data)
+		return *data;
+	virtnet_set_queues(vi, vi->curr_queue_pairs);
+	status = vdev->config->get_status(vdev);
+	vdev->config->set_status(vdev, status | VIRTIO_CONFIG_S_DRIVER_OK);
+	return 0;
+}
 
 static struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_NET, VIRTIO_DEV_ANY_ID },

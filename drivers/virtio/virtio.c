@@ -117,11 +117,10 @@ void virtio_check_driver_offered_feature(const struct virtio_device *vdev,
 }
 EXPORT_SYMBOL_GPL(virtio_check_driver_offered_feature);
 
-static int virtio_dev_probe(struct device *_d)
+int virtio_feature_negotiate(struct virtio_device *dev)
 {
-	int err, i;
-	struct virtio_device *dev = dev_to_virtio(_d);
 	struct virtio_driver *drv = drv_to_virtio(dev->dev.driver);
+	int i;
 	u32 device_features;
 
 	/* We have a driver! */
@@ -134,7 +133,8 @@ static int virtio_dev_probe(struct device *_d)
 	memset(dev->features, 0, sizeof(dev->features));
 	for (i = 0; i < drv->feature_table_size; i++) {
 		unsigned int f = drv->feature_table[i];
-		BUG_ON(f >= 32);
+		if (f >= 32)
+			return -EINVAL;
 		if (device_features & (1 << f))
 			set_bit(f, dev->features);
 	}
@@ -145,7 +145,19 @@ static int virtio_dev_probe(struct device *_d)
 			set_bit(i, dev->features);
 
 	dev->config->finalize_features(dev);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(virtio_feature_negotiate);
 
+static int virtio_dev_probe(struct device *_d)
+{
+	int err;
+	struct virtio_device *dev = dev_to_virtio(_d);
+	struct virtio_driver *drv = drv_to_virtio(dev->dev.driver);
+
+	err = virtio_feature_negotiate(dev);
+	if (err)
+		return err;
 	err = drv->probe(dev);
 	if (err)
 		add_status(dev, VIRTIO_CONFIG_S_FAILED);

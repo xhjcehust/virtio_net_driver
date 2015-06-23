@@ -98,6 +98,8 @@ struct virtio_device {
 	void *priv;
 };
 
+int virtio_feature_negotiate(struct virtio_device *dev);
+
 static inline struct virtio_device *dev_to_virtio(struct device *_dev)
 {
 	return container_of(_dev, struct virtio_device, dev);

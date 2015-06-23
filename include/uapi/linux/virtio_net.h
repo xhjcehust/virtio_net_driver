@@ -201,4 +201,13 @@ struct virtio_net_ctrl_mq {
  #define VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN        1
  #define VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MAX        0x8000
 
+ /*
+  * Control Loopback(5 is used by VIRTIO_NET_CTRL_GUEST_OFFLOADS in latest qemu)
+  *
+  * The command VIRTIO_NET_CTRL_LOOPBACK_SET is used to require the device come
+  * into loopback state.
+  */
+#define VIRTIO_NET_CTRL_LOOPBACK   6
+ #define VIRTIO_NET_CTRL_LOOPBACK_SET        0
+ #define VIRTIO_NET_CTRL_LOOPBACK_UNSET        1
 #endif /* _LINUX_VIRTIO_NET_H */
